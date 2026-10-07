@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Choose the shell new panes launch with `terminal.shell`, instead of always using `$SHELL`.
+- Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
 
 ## 0.34
 
