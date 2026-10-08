@@ -6,7 +6,7 @@
 - Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
 - Show the close-pane confirmation over the pane it would close and dim the rest of the window.
 - Support terminals up to 150,000 cells, enough for 5K displays, and stop resending unchanged inline images with every full screen.
-- Fix panes freezing when fast scrolling or other input reaches a program that is busy writing output.
+- Fix panes freezing when a program stops reading its input, such as during fast scrolling. Input to a program that has fallen far behind is now refused as busy instead of blocking the pane.
 
 ## 0.34
 

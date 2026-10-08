@@ -522,6 +522,24 @@ impl GhosttyTerminal {
         self.snapshot_viewport_and_restore_bottom()
     }
 
+    /// Like `mouse_input`, but a report that would reach the child is dropped.
+    /// Everything else still happens as if it had been forwarded, including
+    /// returning a scrolled-back viewport to the live screen.
+    pub(super) fn withhold_mouse_input(
+        &mut self,
+        event: MouseEvent,
+        offset: Option<usize>,
+    ) -> Result<MouseInputOutcome> {
+        let reaches_child = self.terminal.is_mouse_tracking()?
+            || (matches!(event.kind, MouseEventKind::Wheel { .. })
+                && self.terminal.active_screen()? == Screen::Alternate
+                && self.terminal.mode(Mode::ALT_SCROLL)?);
+        if reaches_child {
+            return self.finish_application_mouse_input(offset);
+        }
+        self.mouse_input(event, offset, true)
+    }
+
     pub(super) fn mouse_input(
         &mut self,
         event: MouseEvent,
@@ -2581,6 +2599,49 @@ mod tests {
         assert!(after.revision > history.screen.revision);
         assert!(history.screen.revision > bottom.revision);
         assert!(terminal.terminal.viewport_active().unwrap());
+    }
+
+    #[test]
+    fn withheld_wheel_reaches_no_child_but_otherwise_acts_as_forwarded() {
+        let (mut tracked, output) = recording_terminal(10, 4);
+        tracked.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
+        output.lock().unwrap().clear();
+        assert!(matches!(
+            tracked
+                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 2, 1), Some(0))
+                .unwrap(),
+            MouseInputOutcome::ReturnedToBottom(_)
+        ));
+        assert!(matches!(
+            tracked
+                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 2, 1), None)
+                .unwrap(),
+            MouseInputOutcome::Handled
+        ));
+
+        // Alternate scroll would turn the wheel into arrow keys for the child.
+        tracked.feed(b"\x1b[?1000l\x1b[?1049h\x1b[?1007h").unwrap();
+        output.lock().unwrap().clear();
+        assert!(matches!(
+            tracked
+                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 2, 1), None)
+                .unwrap(),
+            MouseInputOutcome::Handled
+        ));
+        assert!(output.lock().unwrap().is_empty());
+
+        // Fut's own scrollback still scrolls.
+        let mut terminal = terminal(8, 3);
+        terminal
+            .feed(b"00\r\n01\r\n02\r\n03\r\n04\r\n05")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            terminal
+                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 0, 0), None)
+                .unwrap(),
+            MouseInputOutcome::Scrolled(_)
+        ));
     }
 
     #[test]

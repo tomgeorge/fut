@@ -30,12 +30,15 @@ use super::{
 
 const QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 16;
-// Input waiting for a child that has stopped reading stdin. Beyond this, new
-// input is dropped rather than buffered without bound.
+// Input waiting for a child that has stopped reading stdin. Once the backlog
+// reaches this, new input is rejected as Busy rather than buffered without
+// bound. It bounds the backlog, not a single write, so one large paste to a
+// child that is reading still arrives whole.
 const INPUT_QUEUE_BYTE_LIMIT: usize = 4 * 1024 * 1024;
-// Once this much input is waiting on the child, wheel and motion reports are
-// dropped instead of queued, so a slow program does not keep scrolling long
-// after the wheel stops. Keys, clicks, and paste are still queued.
+// Once more input than this is waiting on the child (about 100 SGR wheel
+// reports), wheel and hover reports are withheld instead of queued, so a slow
+// program does not keep scrolling long after the wheel stops. Keys, clicks,
+// drags, and paste are still queued.
 const DISPOSABLE_INPUT_BACKLOG_LIMIT: usize = 1024;
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_REAP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -610,9 +613,33 @@ struct RuntimeQueues {
 }
 
 impl RuntimeQueues {
-    fn input_backlogged(&self) -> bool {
-        self.input_backlog.load(Ordering::Acquire) > DISPOSABLE_INPUT_BACKLOG_LIMIT
+    fn withholds_mouse(&self, kind: MouseEventKind) -> bool {
+        withholds_mouse(kind, self.input_backlog.load(Ordering::Relaxed))
     }
+}
+
+/// How a mouse event may reach the child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseForwarding {
+    Allowed,
+    /// The child is backed up: drop the report, but otherwise act as if it
+    /// had been forwarded.
+    Withheld,
+    /// Only Fut's own scrollback may react, as for an unfocused pane.
+    Denied,
+}
+
+/// Whether a mouse report bound for the child should be dropped because the
+/// child is not keeping up with its input. Drags stay lossless so a program's
+/// live selection still follows the pointer.
+fn withholds_mouse(kind: MouseEventKind, input_backlog: usize) -> bool {
+    let disposable = match kind {
+        MouseEventKind::Wheel { .. } | MouseEventKind::Motion { button: None } => true,
+        MouseEventKind::Motion { button: Some(_) }
+        | MouseEventKind::Press { .. }
+        | MouseEventKind::Release { .. } => false,
+    };
+    disposable && input_backlog > DISPOSABLE_INPUT_BACKLOG_LIMIT
 }
 
 struct RuntimePublishers<'a> {
@@ -888,10 +915,13 @@ fn run(
                     pty_input_allowed,
                     completion,
                 } => {
-                    // Withholding PTY input drops a disposable report bound for
-                    // the child but still scrolls Fut's own scrollback.
-                    let shed = mouse_send_policy(event.kind) == MouseSendPolicy::Disposable
-                        && queues.input_backlogged();
+                    let forwarding = if !pty_input_allowed {
+                        MouseForwarding::Denied
+                    } else if queues.withholds_mouse(event.kind) {
+                        MouseForwarding::Withheld
+                    } else {
+                        MouseForwarding::Allowed
+                    };
                     let result = mouse_input_after_output_barrier(
                         &mut queues.output,
                         terminal,
@@ -899,7 +929,7 @@ fn run(
                         &mut reader_complete,
                         event,
                         viewport_offset,
-                        pty_input_allowed && !shed,
+                        forwarding,
                     );
                     let _ = completion.send(result);
                 }
@@ -1306,23 +1336,31 @@ fn mouse_input_after_output_barrier(
     reader_complete: &mut bool,
     event: MouseEvent,
     viewport_offset: Option<usize>,
-    pty_input_allowed: bool,
+    forwarding: MouseForwarding,
 ) -> Result<MouseInputOutcome, CommandError> {
     drain_output_barrier(output, terminal, publishers, reader_complete);
     if *reader_complete {
         return Err(CommandError::Stopped);
     }
-    terminal
-        .mouse_input(event, viewport_offset, pty_input_allowed)
-        .map_err(terminal_input_error)
+    let result = match forwarding {
+        MouseForwarding::Allowed => terminal.mouse_input(event, viewport_offset, true),
+        MouseForwarding::Withheld => terminal.withhold_mouse_input(event, viewport_offset),
+        MouseForwarding::Denied => terminal.mouse_input(event, viewport_offset, false),
+    };
+    result.map_err(terminal_input_error)
 }
 
 fn terminal_input_error(error: anyhow::Error) -> CommandError {
-    if error
+    let io_error = error
         .chain()
-        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
-    {
-        CommandError::Stopped
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    if let Some(io_error) = io_error {
+        // A full input backlog means the child is alive but not reading.
+        if io_error.kind() == std::io::ErrorKind::WouldBlock {
+            CommandError::Busy
+        } else {
+            CommandError::Stopped
+        }
     } else {
         CommandError::Emulator(error.to_string())
     }
@@ -1612,11 +1650,22 @@ fn output_queue() -> (OutputProducer, OutputQueue) {
 /// never drained, the runtime stops draining the output queue, and the PTY
 /// reader blocks on that full queue. Queued writes keep FIFO order across key,
 /// mouse, paste, and VT reply input because every caller shares this writer.
+///
+/// Writes are acknowledged once queued. A PTY write failure is reported by the
+/// next write instead; by then the child is gone and the runtime sees its exit.
 struct PtyInputQueue {
     sender: channel::Sender<Vec<u8>>,
+    /// Queued bytes the PTY has not yet accepted. Only the runtime thread adds
+    /// to it (writes are serialized by the shared writer's mutex), so the
+    /// limit check and the add cannot race; the writer thread only subtracts.
     pending: Arc<AtomicUsize>,
-    failure: Arc<Mutex<Option<(std::io::ErrorKind, String)>>>,
-    overflow_logged: bool,
+    failure: Arc<Mutex<Option<PtyWriteFailure>>>,
+}
+
+#[derive(Clone)]
+struct PtyWriteFailure {
+    kind: std::io::ErrorKind,
+    message: String,
 }
 
 fn spawn_pty_writer(
@@ -1634,11 +1683,16 @@ fn spawn_pty_writer(
             // Exits once every queue handle is dropped, which also drops the
             // PTY writer.
             for bytes in receiver {
-                let result = pty.write_all(&bytes).and_then(|()| pty.flush());
-                writer_pending.fetch_sub(bytes.len(), Ordering::AcqRel);
-                if let Err(error) = result {
-                    if let Ok(mut failure) = writer_failure.lock() {
-                        *failure = Some((error.kind(), error.to_string()));
+                if let Err(error) = write_counting(&mut *pty, &bytes, &writer_pending) {
+                    // Publish the failure before exiting, so later writes are
+                    // refused instead of queued behind a writer that is gone.
+                    let failure = PtyWriteFailure {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    };
+                    match writer_failure.lock() {
+                        Ok(mut slot) => *slot = Some(failure),
+                        Err(poisoned) => *poisoned.into_inner() = Some(failure),
                     }
                     return;
                 }
@@ -1648,35 +1702,63 @@ fn spawn_pty_writer(
         sender,
         pending,
         failure,
-        overflow_logged: false,
     })
+}
+
+/// Writes `bytes`, releasing each chunk from `pending` as the PTY accepts it,
+/// so the backlog reflects what the child has not read rather than how large
+/// the current write is.
+fn write_counting(
+    pty: &mut dyn Write,
+    mut bytes: &[u8],
+    pending: &AtomicUsize,
+) -> std::io::Result<()> {
+    let result = loop {
+        if bytes.is_empty() {
+            break pty.flush();
+        }
+        match pty.write(bytes) {
+            Ok(0) => break Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => {
+                pending.fetch_sub(written, Ordering::Relaxed);
+                bytes = &bytes[written..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => break Err(error),
+        }
+    };
+    pending.fetch_sub(bytes.len(), Ordering::Relaxed);
+    result
 }
 
 impl Write for PtyInputQueue {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if let Some((kind, message)) = self.failure.lock().ok().and_then(|f| f.clone()) {
+        let failure = match self.failure.lock() {
+            Ok(failure) => failure.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(PtyWriteFailure { kind, message }) = failure {
             return Err(std::io::Error::new(kind, message));
         }
         if bytes.is_empty() {
             return Ok(0);
         }
-        // Accept or drop the whole buffer so encoded sequences are never split.
-        let pending = self.pending.load(Ordering::Acquire);
-        if pending.saturating_add(bytes.len()) > INPUT_QUEUE_BYTE_LIMIT {
-            if !self.overflow_logged {
-                self.overflow_logged = true;
-                tracing::warn!(
-                    pending,
-                    "PTY child is not reading input; dropping input until it catches up"
-                );
-            }
-            return Ok(bytes.len());
+        // Accept or refuse the whole buffer so encoded sequences are never
+        // split. The limit bounds the backlog, not this write.
+        if self.pending.load(Ordering::Relaxed) >= INPUT_QUEUE_BYTE_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "the program is not reading its input",
+            ));
         }
-        self.overflow_logged = false;
-        self.pending.fetch_add(bytes.len(), Ordering::AcqRel);
-        self.sender.send(bytes.to_vec()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer stopped")
-        })?;
+        self.pending.fetch_add(bytes.len(), Ordering::Relaxed);
+        if self.sender.send(bytes.to_vec()).is_err() {
+            self.pending.fetch_sub(bytes.len(), Ordering::Relaxed);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "PTY writer stopped",
+            ));
+        }
         Ok(bytes.len())
     }
 
@@ -2173,7 +2255,7 @@ mod tests {
                 &mut reader_complete,
                 event,
                 None,
-                true,
+                MouseForwarding::Allowed,
             )
             .unwrap(),
             MouseInputOutcome::Handled
@@ -2198,7 +2280,7 @@ mod tests {
                 &mut reader_complete,
                 wheel,
                 None,
-                true,
+                MouseForwarding::Allowed,
             )
             .unwrap(),
             MouseInputOutcome::Handled
@@ -2222,7 +2304,7 @@ mod tests {
                 &mut reader_complete,
                 wheel,
                 None,
-                true,
+                MouseForwarding::Allowed,
             )
             .unwrap(),
             MouseInputOutcome::Handled
@@ -2870,7 +2952,7 @@ mod tests {
         // Raw mode makes the PTY input queue fill instead of line-buffering,
         // like a TUI busy re-rendering while scroll-wheel reports pile up.
         let handle = spawn_terminal(shell(
-            "stty raw -echo; printf READY; sleep 60",
+            "stty raw -echo || exit 1; printf READY; sleep 60",
             HashMap::new(),
         ))
         .unwrap();
@@ -2884,64 +2966,144 @@ mod tests {
                 .unwrap();
         }
 
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            handle.resize(TerminalSize {
-                columns: 20,
-                rows: 4,
-            }),
-        )
-        .await
-        .expect("runtime must stay responsive while PTY input is backed up")
-        .unwrap();
+        // A round trip the runtime itself must answer; `resize` only enqueues.
+        tokio::time::timeout(Duration::from_secs(5), handle.foreground_process_id())
+            .await
+            .expect("runtime must stay responsive while PTY input is backed up")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(15), handle.close())
             .await
             .expect("close must not hang behind backed-up PTY input")
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn backed_up_input_drops_wheel_reports_but_keeps_keys() {
-        // The child tracks the mouse but sleeps before reading, so key input
-        // backs up behind it. Once it reads, exactly the keys and the marker
-        // must arrive: wheel reports sent meanwhile would sit between them.
-        let keys = 16 * 1024;
-        let handle = spawn_terminal(shell(
-            &format!(
-                "stty raw -echo; printf '\\033[?1000h\\033[?1006hREADY'; sleep 1; \
-                 printf '['; head -c {} | tr -d k; printf ']DONE'; sleep 60",
-                keys + 1
-            ),
-            HashMap::new(),
-        ))
-        .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
-        wait_for_text(&mut snapshots, "READY").await;
+    /// A PTY writer that holds each write until released and records what it
+    /// accepts. Dropping the release sender opens the gate for good.
+    struct GatedWriter {
+        gate: channel::Receiver<()>,
+        accepted: Arc<Mutex<Vec<u8>>>,
+    }
 
-        handle.input(vec![b'k'; keys]).await.unwrap();
-        for _ in 0..50 {
-            let outcome = handle
-                .mouse_input(
-                    MouseEvent {
-                        kind: MouseEventKind::Wheel {
-                            direction: crate::domain::MouseWheelDirection::Up,
-                        },
-                        column: 0,
-                        row: 0,
-                        modifiers: crate::domain::MouseModifiers::default(),
-                        buttons: crate::domain::MouseButtons::default(),
-                    },
-                    None,
-                    true,
-                )
-                .await
-                .unwrap();
-            assert!(matches!(outcome, MouseInputOutcome::Handled));
+    impl std::io::Write for GatedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let _ = self.gate.recv();
+            self.accepted.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
         }
-        handle.input(b"Z".to_vec()).await.unwrap();
 
-        wait_for_text(&mut snapshots, "[Z]DONE").await;
-        handle.close().await.unwrap();
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition was not reached");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn input_queue_limits_the_backlog_but_not_a_single_write() {
+        let (release, gate) = channel::unbounded();
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = spawn_pty_writer(
+            TerminalId::new(),
+            Box::new(GatedWriter {
+                gate,
+                accepted: Arc::clone(&accepted),
+            }),
+        )
+        .unwrap();
+
+        // A paste larger than the limit still goes through whole when
+        // nothing else is waiting.
+        let paste = vec![b'p'; INPUT_QUEUE_BYTE_LIMIT + 1];
+        queue.write_all(&paste).unwrap();
+        // While the child is not reading, more input is refused, not dropped.
+        let refused = queue.write_all(b"k").unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            terminal_input_error(refused.into()),
+            CommandError::Busy
+        ));
+
+        release.send(()).unwrap();
+        wait_until(|| queue.pending.load(Ordering::Relaxed) == 0);
+        queue.write_all(b"k").unwrap();
+        drop(release);
+        wait_until(|| accepted.lock().unwrap().len() == paste.len() + 1);
+        assert_eq!(accepted.lock().unwrap().last(), Some(&b'k'));
+    }
+
+    #[test]
+    fn input_backlog_counts_only_bytes_the_pty_has_not_accepted() {
+        // Accepts at most four bytes per write, noting the backlog each time.
+        struct Trickle<'a> {
+            pending: &'a AtomicUsize,
+            seen: Vec<usize>,
+        }
+
+        impl std::io::Write for Trickle<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.seen.push(self.pending.load(Ordering::Relaxed));
+                Ok(bytes.len().min(4))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let pending = AtomicUsize::new(10);
+        let mut pty = Trickle {
+            pending: &pending,
+            seen: Vec::new(),
+        };
+        write_counting(&mut pty, &[0; 10], &pending).unwrap();
+        assert_eq!(pty.seen, [10, 6, 2]);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_failed_pty_write_refuses_later_input_as_stopped() {
+        let mut queue = spawn_pty_writer(TerminalId::new(), Box::new(FailingWriter)).unwrap();
+        // The write that fails was already acknowledged when it was queued.
+        queue.write_all(b"k").unwrap();
+        wait_until(|| queue.failure.lock().unwrap().is_some());
+
+        let error = queue.write_all(b"k").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            terminal_input_error(error.into()),
+            CommandError::Stopped
+        ));
+    }
+
+    #[test]
+    fn only_wheel_and_hover_reports_are_withheld_and_only_while_backed_up() {
+        use crate::domain::{MouseButton, MouseWheelDirection};
+
+        let wheel = MouseEventKind::Wheel {
+            direction: MouseWheelDirection::Up,
+        };
+        let hover = MouseEventKind::Motion { button: None };
+        for kind in [wheel, hover] {
+            assert!(!withholds_mouse(kind, 0));
+            assert!(!withholds_mouse(kind, DISPOSABLE_INPUT_BACKLOG_LIMIT));
+            assert!(withholds_mouse(kind, DISPOSABLE_INPUT_BACKLOG_LIMIT + 1));
+        }
+        let button = MouseButton::Left;
+        for kind in [
+            MouseEventKind::Motion {
+                button: Some(button),
+            },
+            MouseEventKind::Press { button },
+            MouseEventKind::Release { button },
+        ] {
+            assert!(!withholds_mouse(kind, usize::MAX));
+        }
     }
 
     #[tokio::test]
