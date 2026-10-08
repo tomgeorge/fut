@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix panes freezing when fast scrolling or other input reaches a program that is busy writing output.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.
