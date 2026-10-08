@@ -5,6 +5,7 @@
 - Choose the shell new panes launch with `terminal.shell`, instead of always using `$SHELL`.
 - Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
 - Show the close-pane confirmation over the pane it would close and dim the rest of the window.
+- Support terminals up to 150,000 cells, enough for 5K displays, and stop resending unchanged inline images with every full screen.
 
 ## 0.34
 
