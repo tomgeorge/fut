@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -30,6 +30,9 @@ use super::{
 
 const QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 16;
+// Input waiting for a child that has stopped reading stdin. Beyond this, new
+// input is dropped rather than buffered without bound.
+const INPUT_QUEUE_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const CLOSE_GRACE_PERIOD: Duration = Duration::from_millis(500);
@@ -627,7 +630,9 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     // Acquire every fallible PTY resource and start the parser before the child
     // exists. After spawn, the runtime thread becomes the sole child owner.
     let reader = pair.master.try_clone_reader()?;
-    let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(
+        spawn_pty_writer(spec.id, pair.master.take_writer()?)?,
+    )));
     let (commands, receiver) = async_mpsc::channel(QUEUE_CAPACITY);
     let (doorbell_sender, doorbell) = channel::bounded(1);
     let commands = RuntimeCommands {
@@ -1580,6 +1585,87 @@ fn output_queue() -> (OutputProducer, OutputQueue) {
             consumed: 0,
         },
     )
+}
+
+/// Hands PTY input to a dedicated writer thread so the VT runtime thread never
+/// blocks in `write(2)`.
+///
+/// A blocking write there deadlocks: when the child is itself blocked writing
+/// output (e.g. a TUI re-rendering on every scroll-wheel event), its stdin is
+/// never drained, the runtime stops draining the output queue, and the PTY
+/// reader blocks on that full queue. Queued writes keep FIFO order across key,
+/// mouse, paste, and VT reply input because every caller shares this writer.
+struct PtyInputQueue {
+    sender: channel::Sender<Vec<u8>>,
+    pending: Arc<AtomicUsize>,
+    failure: Arc<Mutex<Option<(std::io::ErrorKind, String)>>>,
+    overflow_logged: bool,
+}
+
+fn spawn_pty_writer(
+    id: TerminalId,
+    mut pty: Box<dyn Write + Send>,
+) -> std::io::Result<PtyInputQueue> {
+    let (sender, receiver) = channel::unbounded::<Vec<u8>>();
+    let pending = Arc::new(AtomicUsize::new(0));
+    let failure = Arc::new(Mutex::new(None));
+    let writer_pending = Arc::clone(&pending);
+    let writer_failure = Arc::clone(&failure);
+    thread::Builder::new()
+        .name(format!("fut-pty-writer-{id}"))
+        .spawn(move || {
+            // Exits once every queue handle is dropped, which also drops the
+            // PTY writer.
+            for bytes in receiver {
+                let result = pty.write_all(&bytes).and_then(|()| pty.flush());
+                writer_pending.fetch_sub(bytes.len(), Ordering::AcqRel);
+                if let Err(error) = result {
+                    if let Ok(mut failure) = writer_failure.lock() {
+                        *failure = Some((error.kind(), error.to_string()));
+                    }
+                    return;
+                }
+            }
+        })?;
+    Ok(PtyInputQueue {
+        sender,
+        pending,
+        failure,
+        overflow_logged: false,
+    })
+}
+
+impl Write for PtyInputQueue {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some((kind, message)) = self.failure.lock().ok().and_then(|f| f.clone()) {
+            return Err(std::io::Error::new(kind, message));
+        }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        // Accept or drop the whole buffer so encoded sequences are never split.
+        let pending = self.pending.load(Ordering::Acquire);
+        if pending.saturating_add(bytes.len()) > INPUT_QUEUE_BYTE_LIMIT {
+            if !self.overflow_logged {
+                self.overflow_logged = true;
+                tracing::warn!(
+                    pending,
+                    "PTY child is not reading input; dropping input until it catches up"
+                );
+            }
+            return Ok(bytes.len());
+        }
+        self.overflow_logged = false;
+        self.pending.fetch_add(bytes.len(), Ordering::AcqRel);
+        self.sender.send(bytes.to_vec()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer stopped")
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn read_pty(mut reader: Box<dyn Read + Send>, output: OutputProducer) {
@@ -2760,6 +2846,41 @@ mod tests {
             .await
             .unwrap();
         assert!(!matches!(close, Err(CommandError::Busy)));
+    }
+
+    #[tokio::test]
+    async fn input_to_a_child_that_stops_reading_cannot_stall_the_runtime() {
+        // Raw mode makes the PTY input queue fill instead of line-buffering,
+        // like a TUI busy re-rendering while scroll-wheel reports pile up.
+        let handle = spawn_terminal(shell(
+            "stty raw -echo; printf READY; sleep 60",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "READY").await;
+        let wheel = b"\x1b[<65;10;10M".repeat(1024);
+        for _ in 0..16 {
+            tokio::time::timeout(Duration::from_secs(5), handle.input(wheel.clone()))
+                .await
+                .expect("input must not wait on a child that is not reading")
+                .unwrap();
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.resize(TerminalSize {
+                columns: 20,
+                rows: 4,
+            }),
+        )
+        .await
+        .expect("runtime must stay responsive while PTY input is backed up")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), handle.close())
+            .await
+            .expect("close must not hang behind backed-up PTY input")
+            .unwrap();
     }
 
     #[tokio::test]
