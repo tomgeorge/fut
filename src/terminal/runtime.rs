@@ -33,6 +33,10 @@ const OUTPUT_QUEUE_CAPACITY: usize = 16;
 // Input waiting for a child that has stopped reading stdin. Beyond this, new
 // input is dropped rather than buffered without bound.
 const INPUT_QUEUE_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+// Once this much input is waiting on the child, wheel and motion reports are
+// dropped instead of queued, so a slow program does not keep scrolling long
+// after the wheel stops. Keys, clicks, and paste are still queued.
+const DISPOSABLE_INPUT_BACKLOG_LIMIT: usize = 1024;
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const CLOSE_GRACE_PERIOD: Duration = Duration::from_millis(500);
@@ -601,6 +605,14 @@ struct RuntimeQueues {
     control: async_mpsc::Receiver<RuntimeMessage>,
     doorbell: channel::Receiver<()>,
     output: OutputQueue,
+    /// Bytes queued for the PTY writer thread but not yet accepted by the PTY.
+    input_backlog: Arc<AtomicUsize>,
+}
+
+impl RuntimeQueues {
+    fn input_backlogged(&self) -> bool {
+        self.input_backlog.load(Ordering::Acquire) > DISPOSABLE_INPUT_BACKLOG_LIMIT
+    }
 }
 
 struct RuntimePublishers<'a> {
@@ -630,9 +642,9 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     // Acquire every fallible PTY resource and start the parser before the child
     // exists. After spawn, the runtime thread becomes the sole child owner.
     let reader = pair.master.try_clone_reader()?;
-    let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(
-        spawn_pty_writer(spec.id, pair.master.take_writer()?)?,
-    )));
+    let input = spawn_pty_writer(spec.id, pair.master.take_writer()?)?;
+    let input_backlog = Arc::clone(&input.pending);
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(input)));
     let (commands, receiver) = async_mpsc::channel(QUEUE_CAPACITY);
     let (doorbell_sender, doorbell) = channel::bounded(1);
     let commands = RuntimeCommands {
@@ -692,6 +704,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
                     control: receiver,
                     doorbell,
                     output: output_queue,
+                    input_backlog,
                 },
                 RuntimePublishers {
                     snapshots: &runtime_snapshots,
@@ -875,6 +888,10 @@ fn run(
                     pty_input_allowed,
                     completion,
                 } => {
+                    // Withholding PTY input drops a disposable report bound for
+                    // the child but still scrolls Fut's own scrollback.
+                    let shed = mouse_send_policy(event.kind) == MouseSendPolicy::Disposable
+                        && queues.input_backlogged();
                     let result = mouse_input_after_output_barrier(
                         &mut queues.output,
                         terminal,
@@ -882,7 +899,7 @@ fn run(
                         &mut reader_complete,
                         event,
                         viewport_offset,
-                        pty_input_allowed,
+                        pty_input_allowed && !shed,
                     );
                     let _ = completion.send(result);
                 }
@@ -2881,6 +2898,50 @@ mod tests {
             .await
             .expect("close must not hang behind backed-up PTY input")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn backed_up_input_drops_wheel_reports_but_keeps_keys() {
+        // The child tracks the mouse but sleeps before reading, so key input
+        // backs up behind it. Once it reads, exactly the keys and the marker
+        // must arrive: wheel reports sent meanwhile would sit between them.
+        let keys = 16 * 1024;
+        let handle = spawn_terminal(shell(
+            &format!(
+                "stty raw -echo; printf '\\033[?1000h\\033[?1006hREADY'; sleep 1; \
+                 printf '['; head -c {} | tr -d k; printf ']DONE'; sleep 60",
+                keys + 1
+            ),
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "READY").await;
+
+        handle.input(vec![b'k'; keys]).await.unwrap();
+        for _ in 0..50 {
+            let outcome = handle
+                .mouse_input(
+                    MouseEvent {
+                        kind: MouseEventKind::Wheel {
+                            direction: crate::domain::MouseWheelDirection::Up,
+                        },
+                        column: 0,
+                        row: 0,
+                        modifiers: crate::domain::MouseModifiers::default(),
+                        buttons: crate::domain::MouseButtons::default(),
+                    },
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, MouseInputOutcome::Handled));
+        }
+        handle.input(b"Z".to_vec()).await.unwrap();
+
+        wait_for_text(&mut snapshots, "[Z]DONE").await;
+        handle.close().await.unwrap();
     }
 
     #[tokio::test]
