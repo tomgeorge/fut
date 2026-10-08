@@ -48,6 +48,17 @@ const KITTY_APC_BYTES: usize = 24 * 1024 * 1024;
 /// `kitty_image` frame is therefore at most this large.
 pub(crate) const KITTY_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Whether a mouse report may be forwarded to the child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MouseForwarding {
+    Allowed,
+    /// The child is not keeping up with its input: drop the report, but
+    /// otherwise act as if it had been forwarded.
+    Withheld,
+    /// Only Fut's own scrollback may react, as for an unfocused pane.
+    Denied,
+}
+
 pub(crate) enum MouseInputOutcome {
     Handled,
     ReturnedToBottom(ViewportSnapshot),
@@ -522,54 +533,46 @@ impl GhosttyTerminal {
         self.snapshot_viewport_and_restore_bottom()
     }
 
-    /// Like `mouse_input`, but a report that would reach the child is dropped.
-    /// Everything else still happens as if it had been forwarded, including
-    /// returning a scrolled-back viewport to the live screen.
-    pub(super) fn withhold_mouse_input(
-        &mut self,
-        event: MouseEvent,
-        offset: Option<usize>,
-    ) -> Result<MouseInputOutcome> {
-        let reaches_child = self.terminal.is_mouse_tracking()?
-            || (matches!(event.kind, MouseEventKind::Wheel { .. })
-                && self.terminal.active_screen()? == Screen::Alternate
-                && self.terminal.mode(Mode::ALT_SCROLL)?);
-        if reaches_child {
-            return self.finish_application_mouse_input(offset);
-        }
-        self.mouse_input(event, offset, true)
-    }
-
+    #[cfg(test)]
     pub(super) fn mouse_input(
         &mut self,
         event: MouseEvent,
         offset: Option<usize>,
         pty_input_allowed: bool,
     ) -> Result<MouseInputOutcome> {
+        let forwarding = if pty_input_allowed {
+            MouseForwarding::Allowed
+        } else {
+            MouseForwarding::Denied
+        };
+        self.mouse_input_with(event, offset, forwarding)
+    }
+
+    pub(super) fn mouse_input_with(
+        &mut self,
+        event: MouseEvent,
+        offset: Option<usize>,
+        forwarding: MouseForwarding,
+    ) -> Result<MouseInputOutcome> {
         let MouseEventKind::Wheel { direction } = event.kind else {
-            if !pty_input_allowed || !self.terminal.is_mouse_tracking()? {
+            if !self.terminal.is_mouse_tracking()? {
                 return Ok(MouseInputOutcome::Handled);
             }
-            self.forward_mouse(event)?;
-            return self.finish_application_mouse_input(offset);
+            return self
+                .deliver_mouse(forwarding, offset, |terminal| terminal.forward_mouse(event));
         };
 
         if self.terminal.is_mouse_tracking()? {
-            if !pty_input_allowed {
-                return Ok(MouseInputOutcome::Handled);
-            }
-            self.forward_mouse(event)?;
-            return self.finish_application_mouse_input(offset);
+            return self
+                .deliver_mouse(forwarding, offset, |terminal| terminal.forward_mouse(event));
         }
 
         if self.terminal.active_screen()? == Screen::Alternate
             && self.terminal.mode(Mode::ALT_SCROLL)?
         {
-            if !pty_input_allowed {
-                return Ok(MouseInputOutcome::Handled);
-            }
-            self.forward_alternate_scroll(direction)?;
-            return self.finish_application_mouse_input(offset);
+            return self.deliver_mouse(forwarding, offset, |terminal| {
+                terminal.forward_alternate_scroll(direction)
+            });
         }
 
         // Overscroll cannot move the viewport; drop it before it costs a
@@ -598,6 +601,25 @@ impl GhosttyTerminal {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
         self.snapshot_viewport_and_restore_bottom()
             .map(MouseInputOutcome::Scrolled)
+    }
+
+    /// Sends a mouse report to the child as `forwarding` allows. A withheld
+    /// report is dropped, but the viewport still returns to the live screen as
+    /// if it had been sent.
+    fn deliver_mouse(
+        &mut self,
+        forwarding: MouseForwarding,
+        offset: Option<usize>,
+        forward: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<MouseInputOutcome> {
+        match forwarding {
+            MouseForwarding::Allowed => {
+                forward(self)?;
+                self.finish_application_mouse_input(offset)
+            }
+            MouseForwarding::Withheld => self.finish_application_mouse_input(offset),
+            MouseForwarding::Denied => Ok(MouseInputOutcome::Handled),
+        }
     }
 
     fn finish_application_mouse_input(
@@ -2603,45 +2625,63 @@ mod tests {
 
     #[test]
     fn withheld_wheel_reaches_no_child_but_otherwise_acts_as_forwarded() {
+        let up = || wheel(MouseWheelDirection::Up, 2, 1);
         let (mut tracked, output) = recording_terminal(10, 4);
-        tracked.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
-        output.lock().unwrap().clear();
-        assert!(matches!(
-            tracked
-                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 2, 1), Some(0))
-                .unwrap(),
-            MouseInputOutcome::ReturnedToBottom(_)
-        ));
-        assert!(matches!(
-            tracked
-                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 2, 1), None)
-                .unwrap(),
-            MouseInputOutcome::Handled
-        ));
+        tracked
+            .feed(b"00\r\n01\r\n02\r\n03\r\n04\r\n05\r\n06")
+            .unwrap()
+            .unwrap();
+        // Scroll back while the program does not track the mouse.
+        let MouseInputOutcome::Scrolled(history) = tracked
+            .mouse_input_with(up(), None, MouseForwarding::Withheld)
+            .unwrap()
+        else {
+            panic!("an untracked wheel must scroll Fut's own scrollback");
+        };
+        assert!(history.offset.is_some());
+        assert!(output.lock().unwrap().is_empty());
 
-        // Alternate scroll would turn the wheel into arrow keys for the child.
-        tracked.feed(b"\x1b[?1000l\x1b[?1049h\x1b[?1007h").unwrap();
+        tracked.feed(b"\x1b[?1000h\x1b[?1006h").unwrap();
         output.lock().unwrap().clear();
+        let MouseInputOutcome::ReturnedToBottom(bottom) = tracked
+            .mouse_input_with(up(), history.offset, MouseForwarding::Withheld)
+            .unwrap()
+        else {
+            panic!("a withheld wheel must still return to the live screen");
+        };
+        assert_eq!(bottom.offset, None);
+        assert!(text(&bottom.screen).contains("06"));
+        assert!(output.lock().unwrap().is_empty());
         assert!(matches!(
             tracked
-                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 2, 1), None)
+                .mouse_input_with(up(), None, MouseForwarding::Withheld)
                 .unwrap(),
             MouseInputOutcome::Handled
         ));
         assert!(output.lock().unwrap().is_empty());
-
-        // Fut's own scrollback still scrolls.
-        let mut terminal = terminal(8, 3);
-        terminal
-            .feed(b"00\r\n01\r\n02\r\n03\r\n04\r\n05")
-            .unwrap()
+        tracked
+            .mouse_input_with(up(), None, MouseForwarding::Allowed)
             .unwrap();
+        assert_eq!(output.lock().unwrap().as_slice(), b"\x1b[<64;3;2M");
+
+        // Alternate scroll would turn the wheel into arrow keys for the child.
+        tracked.feed(b"\x1b[?1000l\x1b[?1049h\x1b[?1007h").unwrap();
+        assert!(!tracked.terminal.is_mouse_tracking().unwrap());
+        assert_eq!(tracked.terminal.active_screen().unwrap(), Screen::Alternate);
+        assert!(tracked.terminal.mode(Mode::ALT_SCROLL).unwrap());
+        output.lock().unwrap().clear();
+        tracked
+            .mouse_input_with(up(), None, MouseForwarding::Allowed)
+            .unwrap();
+        assert!(!output.lock().unwrap().is_empty());
+        output.lock().unwrap().clear();
         assert!(matches!(
-            terminal
-                .withhold_mouse_input(wheel(MouseWheelDirection::Up, 0, 0), None)
+            tracked
+                .mouse_input_with(up(), None, MouseForwarding::Withheld)
                 .unwrap(),
-            MouseInputOutcome::Scrolled(_)
+            MouseInputOutcome::Handled
         ));
+        assert!(output.lock().unwrap().is_empty());
     }
 
     #[test]
