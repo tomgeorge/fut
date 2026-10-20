@@ -247,6 +247,11 @@
       "properties": {
         "pane_layout": { "enum": ["splits", "accordion"], "default": "splits" },
         "confirm_close": { "type": "boolean", "default": true },
+        "dim_inactive_panes": {
+          "type": "boolean",
+          "default": true,
+          "description": "Dim panes without focus while a tab shows several."
+        },
         "prefix": { "$ref": "#/definitions/key" },
         "bindings": { "$ref": "#/definitions/bindings" },
         "hotkeys": { "$ref": "#/definitions/hotkeys" },

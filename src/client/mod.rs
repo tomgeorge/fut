@@ -4212,6 +4212,7 @@ async fn run_loop(
                             layout.terminal,
                             ui.pane_layout,
                             &ui.styles,
+                            ui.dim_inactive_panes,
                             frame.buffer_mut(),
                         );
                         let close_pane_area = close_target.confirming_pane().and_then(|pane_id| {
@@ -7803,9 +7804,12 @@ fn render_view(
     area: Rect,
     policy: PaneLayoutPolicy,
     styles: &config::StylesConfig,
+    dim_inactive_panes: bool,
     buffer: &mut Buffer,
 ) -> Option<RenderedCursor> {
     let (layouts, dividers) = view.pane_layouts(area, policy);
+    // A lone (or zoomed) pane has nothing to be distinguished from.
+    let dim_inactive_panes = dim_inactive_panes && layouts.len() > 1;
     let divider_style = styles.apply(
         config::SemanticStyle::Divider,
         styles.apply(config::SemanticStyle::Normal, Style::default()),
@@ -7866,6 +7870,9 @@ fn render_view(
             divider_style,
             buffer,
         );
+        if dim_inactive_panes && pane.target.terminal_id != view.focused {
+            dim_area(*content, buffer);
+        }
         if pane.target.terminal_id == view.focused
             && screen.cursor.visible
             && screen.cursor.column < content.width
@@ -7880,6 +7887,16 @@ fn render_view(
         }
     }
     cursor
+}
+
+fn dim_area(area: Rect, buffer: &mut Buffer) {
+    for row in area.y..area.bottom() {
+        for column in area.x..area.right() {
+            if let Some(cell) = buffer.cell_mut((column, row)) {
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
 }
 
 /// Dim everything in `area` except `keep`, so a close prompt clearly points at
@@ -10360,6 +10377,7 @@ mod tests {
                 area,
                 PaneLayoutPolicy::Accordion,
                 &UiConfig::default().styles,
+                true,
                 &mut buffer,
             ),
             Some(RenderedCursor {
@@ -10377,6 +10395,8 @@ mod tests {
         assert_eq!(buffer[(25, 0)].symbol(), "│");
         assert_eq!(buffer[(25, 0)].fg, Color::DarkGray);
         assert_eq!(buffer[(26, 0)].symbol(), "B");
+        assert!(!buffer[(1, 0)].modifier.contains(Modifier::DIM));
+        assert!(buffer[(26, 0)].modifier.contains(Modifier::DIM));
 
         state
             .replace(selected_view(1, panes[1].clone(), panes))
@@ -10388,6 +10408,7 @@ mod tests {
                 area,
                 PaneLayoutPolicy::Accordion,
                 &UiConfig::default().styles,
+                false,
                 &mut moved,
             ),
             Some(RenderedCursor {
@@ -10399,6 +10420,7 @@ mod tests {
         );
         assert_eq!(moved[(0, 0)].fg, Color::DarkGray);
         assert!(moved[(13, 0)].modifier.contains(Modifier::BOLD));
+        assert!((0..area.width).all(|column| !moved[(column, 0)].modifier.contains(Modifier::DIM)));
 
         let tiny = Rect::new(0, 0, 20, 2);
         let mut tiny_buffer = Buffer::empty(tiny);
@@ -10408,6 +10430,7 @@ mod tests {
                 tiny,
                 PaneLayoutPolicy::Accordion,
                 &UiConfig::default().styles,
+                true,
                 &mut tiny_buffer,
             ),
             Some(RenderedCursor {
@@ -10418,6 +10441,7 @@ mod tests {
             })
         );
         assert_eq!(tiny_buffer[(0, 0)].symbol(), "B");
+        assert!(!tiny_buffer[(0, 0)].modifier.contains(Modifier::DIM));
         assert!((0..tiny.width).all(|column| tiny_buffer[(column, 0)].symbol() != "┃"));
     }
 

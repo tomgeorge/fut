@@ -1496,6 +1496,7 @@ pub(super) struct SidebarConfig {
 pub(crate) struct UiConfig {
     pub(super) pane_layout: PaneLayoutPolicy,
     pub(super) confirm_close: bool,
+    pub(super) dim_inactive_panes: bool,
     prefix: String,
     pub(super) bindings: BindingsConfig,
     hotkeys: BTreeMap<String, String>,
@@ -1521,6 +1522,7 @@ impl Default for UiConfig {
         Self {
             pane_layout: PaneLayoutPolicy::Splits,
             confirm_close: true,
+            dim_inactive_panes: true,
             prefix: "ctrl-b".into(),
             bindings: BindingsConfig::default(),
             hotkeys: BTreeMap::new(),
@@ -3484,6 +3486,7 @@ components = [{ component = "workspaces", row = { body = [{ token = "agent.sourc
 [ui]
 pane_layout = "accordion"
 confirm_close = false
+dim_inactive_panes = false
 
 [ui.icons]
 preset = "nerd_font"
@@ -3517,6 +3520,8 @@ components = [
         let config = load_path(&path, true).unwrap();
         assert_eq!(config.pane_layout, PaneLayoutPolicy::Accordion);
         assert!(!config.confirm_close);
+        assert!(!config.dim_inactive_panes);
+        assert!(UiConfig::default().dim_inactive_panes);
         assert_eq!(config.tab_bar.position, TabBarPosition::Bottom);
         assert_eq!(config.sidebar.left.width, 30);
         assert_eq!(config.sidebar.left.display, SidebarDisplay::Minimized);
