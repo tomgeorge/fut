@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Dim unfocused panes while a tab shows several; turn this off with `ui.dim_inactive_panes = false`.
+
 ## 0.38
 
 - Run configured and extension commands on the attached remote machine, including interactive popups, forms, and background commands.

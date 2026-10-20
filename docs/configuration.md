@@ -59,6 +59,8 @@ remain dynamic and are validated by Fut when it loads the configuration.
 
 Closing a pane, tab, workspace, or session asks for confirmation by default. While the prompt is open, it exclusively owns keyboard, paste, and pointer input; resizing the host terminal remains available. A pane close prompt appears over the pane it would close and dims the rest of the window. Set `ui.confirm_close = false` to perform those close actions immediately. This setting is client-local and applies to both keyboard commands and contextual menus. Interactive rename and close actions can change only the session to which that client is attached and resources within it. A tab, workspace, or session close can finish only partway if a later terminal cannot close; Fut reports how many terminals exited and keeps the target marked closing because those exits cannot be undone.
 
+When a tab shows more than one pane, Fut dims the panes without focus so the focused one stands out. Set `ui.dim_inactive_panes = false` to render every pane at full intensity. Dimming uses the host terminal's faint attribute, so its exact appearance depends on that terminal.
+
 Terminal-native alerts are configured at the top level. They are separate
 from coding-agent lifecycle notifications:
 
@@ -159,6 +161,7 @@ shell = "/opt/homebrew/bin/fish"
 [ui]
 pane_layout = "splits" # "splits" or "accordion"
 confirm_close = true   # Require confirmation before closing panes, tabs, or workspaces.
+dim_inactive_panes = true # Dim panes without focus while a tab shows several.
 prefix = "ctrl-b"
 
 [ui.bindings]
