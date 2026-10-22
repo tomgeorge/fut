@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep Shift on Ctrl+Shift+letter shortcuts, so apps in a pane, such as pi, receive `ctrl+shift+c` as they do outside Fut.
 - Dim unfocused panes while a tab shows several; turn this off with `ui.dim_inactive_panes = false`.
 
 ## 0.38
