@@ -1,5 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{protocol::SelectedTarget, resources::ResourceSnapshot};
@@ -264,18 +268,33 @@ impl AgentsDialog {
                 .enumerate()
             {
                 let row = &self.rows[*index];
-                let style = apply_item_state(
-                    styles,
-                    ItemState {
-                        current: row.current,
-                        selected: *index == self.selected,
-                        closing: false,
-                        attention: false,
-                    },
-                    styles.apply(SemanticStyle::Normal, Style::default()),
-                );
-                let activity_style = styles.apply(row.activity_style(), style);
-                let status_style = styles.apply(row.status_style(), style);
+                let selected = *index == self.selected;
+                // The cursor is the strongest cue in a picker, so it takes the
+                // current pill; the agent you're in keeps only bold and its marker.
+                let mut style = styles.apply(SemanticStyle::Normal, Style::default());
+                if row.current {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if selected {
+                    style = apply_item_state(
+                        styles,
+                        ItemState {
+                            current: true,
+                            ..ItemState::default()
+                        },
+                        style,
+                    );
+                }
+                // A status foreground on a reversed pill would become its
+                // background, so the pill row stays one color.
+                let (activity_style, status_style) = if selected {
+                    (style, style)
+                } else {
+                    (
+                        styles.apply(row.activity_style(), style),
+                        styles.apply(row.status_style(), style),
+                    )
+                };
                 let y = body.y + line as u16;
                 fill_row(Rect::new(body.x, y, body.width, 1), style, buffer);
                 buffer.set_line(
@@ -370,37 +389,39 @@ mod tests {
         domain::{PaneId, StatusState, TerminalId},
     };
 
-    #[test]
-    fn selected_row_keeps_one_background_while_status_owns_only_its_foreground() {
-        let mut dialog = AgentsDialog {
-            rows: vec![AgentItem {
-                machine: MachineId::Local,
-                generation: super::super::federation::Generation::default(),
-                machine_label: None,
-                selectable: true,
-                terminal_id: TerminalId::new(),
-                pane_id: PaneId::new(),
-                session: "fut".into(),
-                workspace: "agents-popup".into(),
-                tab: "node".into(),
-                app: "codex".into(),
-                title: Some("Checking code".into()),
-                message: Some("Running focused tests".into()),
-                blocked_kind: None,
-                state: StatusState::Working,
-                progress: Some(42),
-                current: false,
-                indicator: Some(ActivityIndicator::Working),
-            }],
-            filtered: vec![0],
+    fn dialog(current: bool, selected: usize) -> AgentsDialog {
+        let row = |current| AgentItem {
+            machine: MachineId::Local,
+            generation: super::super::federation::Generation::default(),
+            machine_label: None,
+            selectable: true,
+            terminal_id: TerminalId::new(),
+            pane_id: PaneId::new(),
+            session: "fut".into(),
+            workspace: "agents-popup".into(),
+            tab: "node".into(),
+            app: "codex".into(),
+            title: Some("Checking code".into()),
+            message: Some("Running focused tests".into()),
+            blocked_kind: None,
+            state: StatusState::Working,
+            progress: Some(42),
+            current,
+            indicator: Some(ActivityIndicator::Working),
+        };
+        AgentsDialog {
+            rows: vec![row(false), row(current)],
+            filtered: vec![0, 1],
             query: String::new(),
-            selected: 0,
+            selected,
             scroll: 0,
             federated: false,
-        };
+        }
+    }
+
+    fn render(dialog: &mut AgentsDialog) -> Buffer {
         let host = Rect::new(0, 0, 80, 10);
         let mut buffer = Buffer::empty(host);
-
         dialog.render(
             host,
             0,
@@ -408,15 +429,34 @@ mod tests {
             &StylesConfig::default(),
             &mut buffer,
         );
+        buffer
+    }
+
+    #[test]
+    fn selected_row_takes_the_current_pill_as_one_color() {
+        let buffer = render(&mut dialog(false, 0));
 
         let app = &buffer[(8, 2)];
         let status = &buffer[(14, 2)];
-        assert_eq!(app.bg, Color::DarkGray);
+        assert_eq!(app.fg, Color::Blue);
+        assert!(app.modifier.contains(Modifier::REVERSED));
+        assert_eq!(status.fg, app.fg);
         assert_eq!(status.bg, app.bg);
-        assert_eq!(status.fg, Color::LightCyan);
+        assert_eq!(status.modifier, app.modifier);
         let rendered = (0..80)
             .map(|column| buffer[(column, 2)].symbol())
             .collect::<String>();
         assert!(rendered.contains("⠋ 42% codex working"), "{rendered:?}");
+    }
+
+    #[test]
+    fn current_row_off_the_cursor_is_bold_without_the_pill() {
+        let buffer = render(&mut dialog(true, 0));
+
+        let app = &buffer[(8, 3)];
+        let status = &buffer[(14, 3)];
+        assert!(app.modifier.contains(Modifier::BOLD));
+        assert!(!app.modifier.contains(Modifier::REVERSED));
+        assert_eq!(status.fg, Color::LightCyan);
     }
 }
