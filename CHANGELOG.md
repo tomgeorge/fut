@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Dim unfocused panes while a tab shows several; turn this off with `ui.dim_inactive_panes = false`.
+- Highlight the agents dialog's cursor row with the `current` style, so the row Enter switches to stands out. The agent you're in is shown in bold instead.
 
 ## 0.38
 
